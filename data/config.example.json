@@ -1,0 +1,39 @@
+{
+  "device_name": "dockergo-01",
+  "image_platform": "linux/amd64",
+  "discord_webhook": "",
+  "sites": [
+    {
+      "name": "HOME",
+      "home": true,
+      "ssid": "HouseNet",
+      "password": "changeme",
+      "docker_api": "http://192.168.1.10:2375",
+      "summary_url": "http://localmonitoring.house.mayberry.farm:10000/summary"
+    },
+    {
+      "name": "SITE-A",
+      "home": false,
+      "ssid": "SiteA-AP",
+      "password": "changeme",
+      "docker_api": "http://10.0.0.2:2375",
+      "summary_url": "http://10.0.0.2:10000/summary"
+    },
+    {
+      "name": "SITE-B",
+      "home": false,
+      "ssid": "SiteB-AP",
+      "password": "changeme",
+      "docker_api": "http://10.0.1.2:2375",
+      "summary_url": "http://10.0.1.2:10000/summary"
+    },
+    {
+      "name": "SITE-C",
+      "home": false,
+      "ssid": "SiteC-AP",
+      "password": "changeme",
+      "docker_api": "http://10.0.2.2:2375",
+      "summary_url": "http://10.0.2.2:10000/summary"
+    }
+  ]
+}

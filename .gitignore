@@ -1,0 +1,6 @@
+.pio/
+.vscode/
+!.vscode/extensions.json
+
+# Local SD config may contain Wi-Fi passwords / Discord webhook — never commit
+data/config.json
