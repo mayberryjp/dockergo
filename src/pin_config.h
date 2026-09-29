@@ -10,10 +10,10 @@
 #define PIN_TFT_RST 1
 #define PIN_TFT_BL 38
 
-// --- microSD (TF) card, SD_MMC 1-bit mode ---
-#define PIN_SD_CLK 14
+// --- microSD (TF) card, SD_MMC 1-bit mode (LILYGO T-Dongle-S3: CLK12 CMD16 D0 14) ---
+#define PIN_SD_CLK 12
 #define PIN_SD_CMD 16
-#define PIN_SD_D0 17
+#define PIN_SD_D0 14
 
 // --- On-board controls / LED ---
 #define PIN_BUTTON 0

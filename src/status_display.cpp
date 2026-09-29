@@ -12,7 +12,7 @@ String truncateToWidth(const String& s, int maxChars = 26) {
 
 void StatusDisplay::begin() {
   pinMode(PIN_TFT_BL, OUTPUT);
-  digitalWrite(PIN_TFT_BL, HIGH);  // backlight on
+  digitalWrite(PIN_TFT_BL, LOW);  // backlight on (active-low on T-Dongle-S3)
 
   _tft.init();
   _tft.setRotation(3);  // USB connector to the right; flip to 1 if upside-down
