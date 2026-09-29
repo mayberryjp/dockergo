@@ -199,7 +199,7 @@ flowchart TD
 | `status_display`  | LCD status lines, scrolling log, progress bar, LED                |
 | `wifi_manager`    | Scan, prioritized connect, RSSI, disconnect                       |
 | `summary_client`  | GET summary endpoint, parse `pending_images`                      |
-| `image_store`     | SD layout, cache presence checks, blob/layer paths                |
+| `image_store`     | Shared content-addressed blob store, cache checks, refs + blob GC |
 | `registry_client` | Registry V2 auth, manifest, blob streaming, gunzip + verify       |
 | `docker_client`   | `/images/load`, list/inspect containers, restart                  |
 | `discord_client`  | Webhook POST (batched/rate‑limited)                               |
@@ -231,22 +231,34 @@ For each `pending_images` entry `registry/repo:tag`:
 6. Stream the **config** blob and each **layer** blob to SD, verifying each
    `sha256` digest as it is written.
 
-### 6.2 Store on SD (`image_store`) — OCI image layout
+### 6.2 Store on SD (`image_store`) — shared content-addressed blob store
 
-DockerGo stores the **raw registry blobs** in an OCI image layout and loads that
-archive with `POST /images/load`. Registry blobs are used verbatim (layers stay
+DockerGo stores the **raw registry blobs** in a single content‑addressed store
+shared by all images, and assembles an OCI image archive on the fly to load with
+`POST /images/load`. Registry blobs are used verbatim (layers stay
 gzip‑compressed), so **no on‑device decompression is required** and every blob is
 verified simply by hashing the bytes we received against its manifest digest.
 
+Because blobs are keyed only by their `sha256` digest, a layer shared by several
+images — or re‑pulled for the same image — is **stored once and downloaded
+once**: the download is skipped whenever that digest already exists in the store.
+
 ```
+/blobs/sha256/<hex>                # shared blob store: manifests, configs, layers
+                                   #   (gzip-compressed, verbatim, digest-named)
 /images/<safe-image-id>/
   oci-layout                       # {"imageLayoutVersion":"1.0.0"}
   index.json                       # OCI index -> image manifest, tagged ref
-  blobs/sha256/<manifest-digest>   # the selected image manifest
-  blobs/sha256/<config-digest>     # image config blob
-  blobs/sha256/<layer-digest>      # each layer, gzip-compressed, verbatim
+  refs                             # bare-hex digests this image uses, one per line
+                                   #   (manifest + config + each layer)
   .complete                        # written only after full verification
 ```
+
+Each image directory holds only its OCI metadata plus the `refs` list naming the
+shared blobs it uses; the load tar is rebuilt from those refs, placing each blob
+back under the archive's `blobs/sha256/` path. Removing an image deletes its
+directory and then **garbage‑collects** any blob that no surviving image's `refs`
+still references.
 
 > **Daemon requirement:** loading an OCI archive requires the target daemon to
 > use the **containerd image store** (`features.containerd-snapshotter: true` in
@@ -256,8 +268,9 @@ verified simply by hashing the bytes we received against its manifest digest.
 
 ### 6.3 Apply (at remote) — Daemon API
 
-1. `POST /images/load` with a tar assembled **on the fly** by streaming the SD
-   files above (tar headers computed from known file sizes — no extra RAM).
+1. `POST /images/load` with a tar assembled **on the fly**: `oci-layout` and
+   `index.json` from the image dir, plus each blob named in its `refs` streamed
+   from the shared store (tar headers computed from known file sizes — no extra RAM).
 2. `GET /containers/json?all=1`, match containers whose `Image` corresponds to
    the updated reference.
 3. For each match: **recreate** so the new image is actually used — inspect the
@@ -285,7 +298,7 @@ proves unreliable across daemon storage drivers.
 | `docker load` format variance (overlay2 vs containerd) | Ship OCI archive; require containerd store |
 | Registry rate limits (Docker Hub)              | Anonymous token; surface 429 on LCD     |
 | Container recreate must preserve config/nets    | Copy Config+HostConfig+networks on recreate |
-| SD card exhaustion                             | Cache eviction of `.complete` images    |
+| SD card exhaustion                             | Dedup shared blobs; GC unreferenced blobs on removal |
 
 **Resolved with the user:**
 1. Each site reports its **own** needs; home downloads the **union** of all

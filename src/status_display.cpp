@@ -47,7 +47,7 @@ void StatusDisplay::progress(const String& label, float pct) {
   _tft.fillRect(barX + 1 + fill, barY + 1, (barW - 2) - fill, barH - 2, TFT_BLACK);
 
   // Percentage label centred over the bar.
-  char pctStr[24];
+  char pctStr[40];
   snprintf(pctStr, sizeof(pctStr), "%s %d%%", label.c_str(), (int)(pct * 100));
   _tft.setTextColor(TFT_WHITE, TFT_BLACK);
   _tft.setTextDatum(TC_DATUM);

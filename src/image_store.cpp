@@ -6,6 +6,8 @@
 
 namespace {
 constexpr const char* kBase = "/images";
+constexpr const char* kCas = "/blobs/sha256";  // shared content-addressed blobs
+constexpr const char* kRefs = "refs";          // per-image list of blob digests
 
 String childPath(const String& parent, File& entry) {
   String n = entry.name();
@@ -42,7 +44,7 @@ bool rmrf(const String& path) {
 
 namespace ImageStore {
 
-bool begin() { return ensureDir(kBase); }
+bool begin() { return ensureDir(kBase) && ensureDir(kCas); }
 
 String dirFor(const ImageRef& ref) { return String(kBase) + "/" + ref.safeId(); }
 
@@ -56,7 +58,70 @@ bool markComplete(const ImageRef& ref) {
   return true;
 }
 
-bool removeImage(const ImageRef& ref) { return rmrf(dirFor(ref)); }
+bool removeImage(const ImageRef& ref) {
+  bool ok = rmrf(dirFor(ref));
+  gcUnreferencedBlobs();  // reclaim blobs no surviving image references
+  return ok;
+}
+
+bool ensureCasDir() { return ensureDir(kCas); }
+
+String blobPath(const String& digestHex) { return String(kCas) + "/" + digestHex; }
+
+bool writeRefs(const ImageRef& ref, const std::vector<String>& digestsHex) {
+  File f = SD_MMC.open(dirFor(ref) + "/" + kRefs, FILE_WRITE);
+  if (!f) return false;
+  for (const auto& h : digestsHex) {
+    f.print(h);
+    f.print('\n');
+  }
+  f.close();
+  return true;
+}
+
+int gcUnreferencedBlobs() {
+  // Union of digests still named by some image's refs file.
+  std::vector<String> referenced;
+  if (File images = SD_MMC.open(kBase)) {
+    for (File e = images.openNextFile(); e; e = images.openNextFile()) {
+      if (e.isDirectory()) {
+        if (File rf = SD_MMC.open(childPath(kBase, e) + "/" + kRefs, FILE_READ)) {
+          while (rf.available()) {
+            String h = rf.readStringUntil('\n');
+            h.trim();
+            if (h.length()) referenced.push_back(h);
+          }
+          rf.close();
+        }
+      }
+      e.close();
+    }
+    images.close();
+  }
+
+  // Sweep CAS blobs absent from that union (collect first, then delete so we
+  // never mutate the directory we're still iterating).
+  std::vector<String> victims;
+  if (File cas = SD_MMC.open(kCas)) {
+    for (File b = cas.openNextFile(); b; b = cas.openNextFile()) {
+      if (!b.isDirectory()) {
+        String nm = b.name();
+        String base = nm.substring(nm.lastIndexOf('/') + 1);
+        bool keep = false;
+        for (const auto& r : referenced)
+          if (r == base) {
+            keep = true;
+            break;
+          }
+        if (!keep) victims.push_back(String(kCas) + "/" + base);
+      }
+      b.close();
+    }
+    cas.close();
+  }
+  for (auto& v : victims) SD_MMC.remove(v);
+  return (int)victims.size();
+}
 
 bool ensureDir(const String& path) {
   unsigned i = 1;  // skip leading '/'

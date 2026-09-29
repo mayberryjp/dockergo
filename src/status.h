@@ -12,6 +12,7 @@ class DiscordClient;
 //   error()  -> LCD (error) + Discord
 namespace Status {
 void begin(StatusDisplay* display, DiscordClient* discord);
+void beginSdLog();  // start persisting status lines to /dockergo.log on the SD card
 void stage(DeviceState state, const String& label);
 void info(const String& line);
 void event(const String& line);

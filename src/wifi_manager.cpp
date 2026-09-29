@@ -57,7 +57,9 @@ bool WifiManager::connect(const SiteConfig& site, uint32_t timeoutMs) {
     Status::info(String("Join failed: ") + site.ssid);
     return false;
   }
+  WiFi.setSleep(false);  // modem power-save throttles HTTPS pulls to ~1 KB/s
   Status::info(String("IP ") + WiFi.localIP().toString());
+  Status::info(String("RSSI ") + WiFi.RSSI() + "dBm");
   return true;
 }
 

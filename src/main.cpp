@@ -30,6 +30,7 @@ void setup() {
     Status::error("No SD card");
     return;  // loop() will idle; nothing to do without config
   }
+  Status::beginSdLog();
   Status::info("SD mounted");
   ImageStore::begin();
 

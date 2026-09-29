@@ -7,6 +7,7 @@
 
 #include <vector>
 
+#include "image_store.h"
 #include "net.h"
 #include "status.h"
 
@@ -66,6 +67,18 @@ void buildTarHeader(uint8_t hdr[512], const String& name, size_t size) {
   hdr[155] = ' ';
 }
 
+// Compact human-readable byte count for status/milestone lines.
+String humanBytes(size_t n) {
+  char b[16];
+  if (n >= 1024 * 1024)
+    snprintf(b, sizeof(b), "%.1fMB", n / 1048576.0);
+  else if (n >= 1024)
+    snprintf(b, sizeof(b), "%uKB", (unsigned)(n / 1024));
+  else
+    snprintf(b, sizeof(b), "%uB", (unsigned)n);
+  return String(b);
+}
+
 bool collectEntries(const String& imageDir, std::vector<TarEntry>& out) {
   auto add = [&](const String& tarName, const String& path) {
     File f = SD_MMC.open(path, FILE_READ);
@@ -77,6 +90,23 @@ bool collectEntries(const String& imageDir, std::vector<TarEntry>& out) {
   if (!add("oci-layout", imageDir + "/oci-layout")) return false;
   if (!add("index.json", imageDir + "/index.json")) return false;
 
+  // Blobs live in the shared store; the refs file names exactly the ones this
+  // image uses, sourced from CAS but tarred under the OCI blobs/sha256 path.
+  if (File rf = SD_MMC.open(imageDir + "/refs", FILE_READ)) {
+    while (rf.available()) {
+      String hex = rf.readStringUntil('\n');
+      hex.trim();
+      if (!hex.length()) continue;
+      if (!add("blobs/sha256/" + hex, ImageStore::blobPath(hex))) {
+        rf.close();
+        return false;
+      }
+    }
+    rf.close();
+    return true;
+  }
+
+  // Legacy layout (pre-CAS): blobs stored inside the image dir.
   File dir = SD_MMC.open(imageDir + "/blobs/sha256");
   if (!dir) return false;
   for (File e = dir.openNextFile(); e; e = dir.openNextFile()) {
@@ -226,10 +256,12 @@ bool loadImage(const String& dockerApi, const String& imageDir, String& err) {
 
   size_t contentLength = 1024;  // trailing two zero blocks
   size_t payloadBytes = 0;
+  int blobCount = 0;
   for (auto& e : entries) {
     size_t pad = (512 - (e.size % 512)) % 512;
     contentLength += 512 + e.size + pad;
     payloadBytes += e.size;
+    if (e.tarName.startsWith("blobs/sha256/")) ++blobCount;
   }
 
   WiFiClient client;
@@ -246,10 +278,13 @@ bool loadImage(const String& dockerApi, const String& imageDir, String& err) {
   client.printf("Content-Length: %u\r\n", (unsigned)contentLength);
   client.print("Connection: close\r\n\r\n");
 
+  Status::event(String("upload ") + blobCount + " blobs " + humanBytes(payloadBytes));
+
   uint8_t hdr[512];
   uint8_t buf[2048];
   const uint8_t zeros[512] = {0};
   size_t sent = 0, lastShown = 0;
+  int blobIdx = 0;
 
   for (auto& e : entries) {
     buildTarHeader(hdr, e.tarName, e.size);
@@ -280,6 +315,10 @@ bool loadImage(const String& dockerApi, const String& imageDir, String& err) {
     f.close();
     size_t pad = (512 - (e.size % 512)) % 512;
     if (pad) client.write(zeros, pad);
+    if (e.tarName.startsWith("blobs/sha256/")) {
+      ++blobIdx;
+      Status::event(String("blob ") + blobIdx + "/" + blobCount + " up " + humanBytes(e.size));
+    }
   }
   client.write(zeros, 512);
   client.write(zeros, 512);
