@@ -5,6 +5,7 @@
 #include <SD_MMC.h>
 #include <WiFiClient.h>
 
+#include <utility>
 #include <vector>
 
 #include "image_store.h"
@@ -89,6 +90,7 @@ bool collectEntries(const String& imageDir, std::vector<TarEntry>& out) {
   };
   if (!add("oci-layout", imageDir + "/oci-layout")) return false;
   if (!add("index.json", imageDir + "/index.json")) return false;
+  if (!add("manifest.json", imageDir + "/manifest.json")) return false;
 
   // Blobs live in the shared store; the refs file names exactly the ones this
   // image uses, sourced from CAS but tarred under the OCI blobs/sha256 path.
@@ -144,16 +146,28 @@ int dockerRequest(const String& api, const char* method, const String& path,
   http.setConnectTimeout(10000);
   http.setTimeout(20000);
   int code = http.sendRequest(method, (uint8_t*)reqBody.c_str(), reqBody.length());
-  respBody = http.getString();
+  // 204/304 carry no body and no Content-Length; getString() would then block on
+  // the keep-alive socket waiting for bytes that never arrive (stop/rename/start/
+  // delete all return 204). Only read a body when the response actually has one.
+  if (code > 0 && code != 204 && code != 304) respBody = http.getString();
   http.end();
   return code;
 }
 
-// Recreate one container so it runs `newImage`, preserving its config. The old
-// container is inspected first (config kept in RAM), then stop -> remove ->
-// create (same name) -> reconnect extra networks -> start.
-bool recreateContainer(const String& api, const String& id, const String& newImage,
-                       String& err) {
+// A container captured before its old image is removed, holding everything
+// needed to recreate it on the new image afterwards.
+struct SavedContainer {
+  String id;          // original container id (to stop/remove)
+  String name;        // recreate under the same name
+  String createBody;  // /containers/create body, Image already set to the new ref
+  std::vector<std::pair<String, String>> extraNets;  // net name -> EndpointConfig json
+};
+
+// Inspect a container and capture its create body (Config + HostConfig + first
+// network) plus any extra networks, so it can be recreated on `newImage` after
+// the old image is removed. Does not modify the container.
+bool captureContainer(const String& api, const String& id, const String& newImage,
+                      SavedContainer& out, String& err) {
   String insBody;
   int c = dockerRequest(api, "GET", "/containers/" + id + "/json", "", insBody);
   if (c != 200) {
@@ -166,73 +180,76 @@ bool recreateContainer(const String& api, const String& id, const String& newIma
     return false;
   }
 
-  String name = ins["Name"].as<String>();
-  if (name.startsWith("/")) name = name.substring(1);
+  out.id = id;
+  out.name = ins["Name"].as<String>();
+  if (out.name.startsWith("/")) out.name = out.name.substring(1);
 
+  JsonObject cfg = ins["Config"].as<JsonObject>();
+  JsonObject hcfg = ins["HostConfig"].as<JsonObject>();
+
+  // Reconstruct a clean create body from the fields /containers/create accepts;
+  // replaying the raw inspect Config/HostConfig makes the daemon reject the
+  // create (which then silently rolls back to the old image).
   JsonDocument body;
-  body.set(ins["Config"]);
   body["Image"] = newImage;
-  body["HostConfig"] = ins["HostConfig"];
+  if (cfg["User"].as<String>().length()) body["User"] = cfg["User"];
+  if (cfg["WorkingDir"].as<String>().length()) body["WorkingDir"] = cfg["WorkingDir"];
+  if (!cfg["Env"].isNull()) body["Env"] = cfg["Env"];
+  if (!cfg["Cmd"].isNull()) body["Cmd"] = cfg["Cmd"];
+  if (!cfg["Entrypoint"].isNull()) body["Entrypoint"] = cfg["Entrypoint"];
+  if (!cfg["Labels"].isNull()) body["Labels"] = cfg["Labels"];
+  if (!cfg["ExposedPorts"].isNull()) body["ExposedPorts"] = cfg["ExposedPorts"];
+  if (!cfg["Volumes"].isNull()) body["Volumes"] = cfg["Volumes"];
 
-  // Only one network may be attached at create time; connect the rest after.
-  std::vector<String> extraNets;
+  // Drop the auto-assigned 12-hex hostname so the daemon assigns a fresh one.
+  String hn = cfg["Hostname"].as<String>();
+  bool autoHn = hn.length() == 12;
+  for (size_t i = 0; autoHn && i < hn.length(); ++i)
+    if (!isxdigit((int)hn[i])) autoHn = false;
+  if (hn.length() && !autoHn) body["Hostname"] = hn;
+
+  JsonObject hc = body["HostConfig"].to<JsonObject>();
+  if (!hcfg["Binds"].isNull()) hc["Binds"] = hcfg["Binds"];
+  if (!hcfg["Mounts"].isNull()) hc["Mounts"] = hcfg["Mounts"];
+  if (!hcfg["PortBindings"].isNull()) hc["PortBindings"] = hcfg["PortBindings"];
+  if (!hcfg["RestartPolicy"].isNull()) hc["RestartPolicy"] = hcfg["RestartPolicy"];
+  if (hcfg["NetworkMode"].as<String>().length()) hc["NetworkMode"] = hcfg["NetworkMode"];
+  if (!hcfg["CapAdd"].isNull()) hc["CapAdd"] = hcfg["CapAdd"];
+  if (!hcfg["CapDrop"].isNull()) hc["CapDrop"] = hcfg["CapDrop"];
+  if (hcfg["Privileged"].as<bool>()) hc["Privileged"] = true;
+  if (!hcfg["SecurityOpt"].isNull()) hc["SecurityOpt"] = hcfg["SecurityOpt"];
+  if (!hcfg["Devices"].isNull()) hc["Devices"] = hcfg["Devices"];
+  if (!hcfg["ExtraHosts"].isNull()) hc["ExtraHosts"] = hcfg["ExtraHosts"];
+  if (!hcfg["Dns"].isNull()) hc["Dns"] = hcfg["Dns"];
+  if (!hcfg["DnsSearch"].isNull()) hc["DnsSearch"] = hcfg["DnsSearch"];
+  if (!hcfg["VolumesFrom"].isNull()) hc["VolumesFrom"] = hcfg["VolumesFrom"];
+  if (hcfg["PidMode"].as<String>().length()) hc["PidMode"] = hcfg["PidMode"];
+  if (hcfg["IpcMode"].as<String>().length()) hc["IpcMode"] = hcfg["IpcMode"];
+  if (!hcfg["Tmpfs"].isNull()) hc["Tmpfs"] = hcfg["Tmpfs"];
+
+  // Only one network may be attached at create time; the rest are reconnected
+  // after the container exists.
   JsonObject nets = ins["NetworkSettings"]["Networks"].as<JsonObject>();
   bool first = true;
   if (!nets.isNull()) {
     for (JsonPair kv : nets) {
+      JsonObject src = kv.value().as<JsonObject>();
       if (first) {
         JsonObject ec =
             body["NetworkingConfig"]["EndpointsConfig"][kv.key()].to<JsonObject>();
-        JsonObject src = kv.value().as<JsonObject>();
         if (src["Aliases"].is<JsonArray>()) ec["Aliases"] = src["Aliases"];
         if (src["IPAMConfig"].is<JsonObject>()) ec["IPAMConfig"] = src["IPAMConfig"];
         first = false;
       } else {
-        extraNets.push_back(String(kv.key().c_str()));
+        JsonDocument ep;
+        if (src["Aliases"].is<JsonArray>()) ep["Aliases"] = src["Aliases"];
+        String eps;
+        serializeJson(ep, eps);
+        out.extraNets.push_back({String(kv.key().c_str()), eps});
       }
     }
   }
-
-  String r;
-  dockerRequest(api, "POST", "/containers/" + id + "/stop?t=10", "", r);
-  int rc = dockerRequest(api, "DELETE", "/containers/" + id + "?force=1", "", r);
-  if (rc != 204 && rc != 200) {
-    err = String("remove HTTP ") + rc;
-    return false;
-  }
-
-  String createBody;
-  serializeJson(body, createBody);
-  String cr;
-  int cc = dockerRequest(api, "POST", "/containers/create?name=" + name, createBody, cr);
-  if (cc != 201 && cc != 200) {
-    err = String("create HTTP ") + cc;
-    return false;
-  }
-  JsonDocument crd;
-  deserializeJson(crd, cr);
-  String newId = crd["Id"].as<String>();
-  if (!newId.length()) {
-    err = "create returned no id";
-    return false;
-  }
-
-  for (auto& net : extraNets) {
-    JsonDocument cb;
-    cb["Container"] = newId;
-    JsonObject src = ins["NetworkSettings"]["Networks"][net].as<JsonObject>();
-    if (!src.isNull() && src["Aliases"].is<JsonArray>())
-      cb["EndpointConfig"]["Aliases"] = src["Aliases"];
-    String cbs, rr;
-    serializeJson(cb, cbs);
-    dockerRequest(api, "POST", "/networks/" + net + "/connect", cbs, rr);
-  }
-
-  int sc = dockerRequest(api, "POST", "/containers/" + newId + "/start", "", r);
-  if (sc != 204 && sc != 200) {
-    err = String("start HTTP ") + sc;
-    return false;
-  }
+  serializeJson(body, out.createBody);
   return true;
 }
 
@@ -280,9 +297,12 @@ bool loadImage(const String& dockerApi, const String& imageDir, String& err) {
 
   Status::event(String("upload ") + blobCount + " blobs " + humanBytes(payloadBytes));
 
-  uint8_t hdr[512];
-  uint8_t buf[2048];
-  const uint8_t zeros[512] = {0};
+  // Static, not stack: loadImage runs deep in the call chain and Status::event
+  // below reaches Discord's mbedTLS handshake (~6KB stack). Keeping these 3KB of
+  // buffers on the 8KB loopTask stack overflowed it -> PANIC. Safe: single loopTask.
+  static uint8_t hdr[512];
+  static uint8_t buf[2048];
+  static const uint8_t zeros[512] = {0};
   size_t sent = 0, lastShown = 0;
   int blobIdx = 0;
 
@@ -325,17 +345,96 @@ bool loadImage(const String& dockerApi, const String& imageDir, String& err) {
   Status::clearProgress();
 
   String statusLine = client.readStringUntil('\n');
-  bool ok = statusLine.indexOf(" 200") >= 0;
+  bool httpOk = statusLine.indexOf(" 200") >= 0;
+  // /images/load streams its real result ("Loaded image ID: sha256:…" or an
+  // errorDetail) in the BODY with HTTP 200; the status line alone can't tell a
+  // real load from a silently-rejected tar. Docker closes the socket right after
+  // replying, so drain buffered bytes even once connected() goes false.
+  String resp;
   uint32_t t = millis();
-  while (client.connected() && millis() - t < 3000) {
-    while (client.available()) client.read();
+  while (millis() - t < 5000) {
+    if (client.available()) {
+      char ch = client.read();
+      if (resp.length() < 800) resp += ch;
+      t = millis();
+    } else if (!client.connected()) {
+      break;
+    }
   }
   client.stop();
-  if (!ok) err = "load response: " + statusLine;
-  return ok;
+  Status::info("load resp: " + resp);
+  if (!httpOk) {
+    err = "load HTTP: " + statusLine;
+    return false;
+  }
+  if (resp.indexOf("error") >= 0) {
+    err = "load: " + resp;
+    return false;
+  }
+  return true;
 }
 
-int updateContainersForImage(const String& dockerApi, const ImageRef& ref, String& err) {
+// This daemon's /images/load requires the legacy `docker save` manifest.json;
+// an OCI index alone is rejected ("does not contain a manifest.json"). Synthesize
+// it from the cached image manifest blob so cached and freshly-pulled images load.
+static bool ensureLegacyManifest(const ImageRef& ref, const String& imageDir, String& err) {
+  if (SD_MMC.exists(imageDir + "/manifest.json")) return true;
+
+  File rf = SD_MMC.open(imageDir + "/refs", FILE_READ);
+  if (!rf) { err = "no refs"; return false; }
+  String manHex = rf.readStringUntil('\n');
+  manHex.trim();
+  rf.close();
+  if (!manHex.length()) { err = "empty refs"; return false; }
+
+  File mf = SD_MMC.open(ImageStore::blobPath(manHex), FILE_READ);
+  if (!mf) { err = "no manifest blob"; return false; }
+  String mbody = mf.readString();
+  mf.close();
+
+  JsonDocument md;
+  if (deserializeJson(md, mbody)) { err = "manifest blob parse"; return false; }
+  String cfg = md["config"]["digest"].as<String>();
+  JsonArray layers = md["layers"].as<JsonArray>();
+  if (!cfg.length() || layers.isNull()) { err = "manifest blob fields"; return false; }
+  if (cfg.startsWith("sha256:")) cfg = cfg.substring(7);
+
+  String repoTag;  // Docker's familiar name so the tag lands on the same ref
+  if (ref.registryHost == "registry-1.docker.io") {
+    String r = ref.repo;
+    if (r.startsWith("library/")) r = r.substring(8);
+    repoTag = r + ":" + ref.tag;
+  } else {
+    repoTag = ref.registryHost + "/" + ref.repo + ":" + ref.tag;
+  }
+
+  JsonDocument out;
+  JsonObject e = out.add<JsonObject>();
+  e["Config"] = "blobs/sha256/" + cfg;
+  e["RepoTags"].to<JsonArray>().add(repoTag);
+  JsonArray la = e["Layers"].to<JsonArray>();
+  for (JsonObject l : layers) {
+    String d = l["digest"].as<String>();
+    if (d.startsWith("sha256:")) d = d.substring(7);
+    la.add("blobs/sha256/" + d);
+  }
+  File of = SD_MMC.open(imageDir + "/manifest.json", FILE_WRITE);
+  if (!of) { err = "write manifest.json"; return false; }
+  serializeJson(out, of);
+  of.close();
+  return true;
+}
+
+int deployImage(const String& dockerApi, const ImageRef& ref, const String& imageDir,
+                String& err) {
+  // Load the new image FIRST: nothing is touched until the transfer succeeds, so
+  // a failed download can never take a running container down.
+  if (!ensureLegacyManifest(ref, imageDir, err)) return -1;
+
+  // Capture target containers BEFORE loading: loadImage moves the tag off the old
+  // image, after which /containers/json reports the container by bare id and the
+  // tag-based match can't find it. Capture is read-only, so nothing is mutated
+  // until the transfer below succeeds.
   String listBody;
   int code = dockerRequest(dockerApi, "GET", "/containers/json?all=1", "", listBody);
   if (code != 200) {
@@ -348,18 +447,8 @@ int updateContainersForImage(const String& dockerApi, const ImageRef& ref, Strin
     return -1;
   }
 
-  // Resolve the freshly-loaded image's ID so we can skip containers already on it.
-  String newImageId;
-  {
-    String imgBody;
-    if (dockerRequest(dockerApi, "GET", "/images/" + ref.original + "/json", "", imgBody) == 200) {
-      JsonDocument idoc;
-      if (!deserializeJson(idoc, imgBody)) newImageId = idoc["Id"].as<String>();
-    }
-  }
-
   std::vector<String> cands = matchCandidates(ref);
-  int updated = 0;
+  std::vector<SavedContainer> targets;
   for (JsonObject cont : doc.as<JsonArray>()) {
     String img = cont["Image"].as<String>();
     bool match = false;
@@ -370,26 +459,81 @@ int updateContainersForImage(const String& dockerApi, const ImageRef& ref, Strin
       }
     if (!match) continue;
 
-    String id = cont["Id"].as<String>();
-    String name = cont["Names"][0].as<String>();
-    if (name.startsWith("/")) name = name.substring(1);
+    SavedContainer scn;
+    String cerr;
+    if (!captureContainer(dockerApi, cont["Id"].as<String>(), ref.original, scn, cerr)) {
+      Status::error("capture: " + cerr);
+      continue;
+    }
+    targets.push_back(scn);
+  }
 
-    // Idempotent: leave containers already running the loaded image untouched.
-    if (newImageId.length() && cont["ImageID"].as<String>() == newImageId) {
-      Status::info("up-to-date " + name);
+  if (!loadImage(dockerApi, imageDir, err)) return -1;
+
+  int started = 0;
+  for (auto& scn : targets) {
+    // Stop the old container and park it as <name>_old (a rollback target) rather
+    // than deleting it; clear any stale backup from an interrupted run first.
+    String r;
+    String backup = scn.name + "_old";
+    Status::info("d:stop " + scn.name);
+    dockerRequest(dockerApi, "POST", "/containers/" + scn.id + "/stop?t=10", "", r);
+    Status::info("d:delbak");
+    dockerRequest(dockerApi, "DELETE", "/containers/" + backup + "?force=1", "", r);
+    Status::info("d:rename");
+    int rn = dockerRequest(dockerApi, "POST",
+                           "/containers/" + scn.id + "/rename?name=" + backup, "", r);
+    if (rn != 204 && rn != 200) {
+      Status::error("rename " + scn.name + " HTTP " + rn);
+      dockerRequest(dockerApi, "POST", "/containers/" + scn.id + "/start", "", r);
       continue;
     }
 
-    Status::info("recreate " + name);
-    String e;
-    if (recreateContainer(dockerApi, id, ref.original, e)) {
-      ++updated;
-      Status::event("Updated " + name);
+    Status::info("d:create body=" + String(scn.createBody.length()));
+    String fail, newId, cr;
+    int cc = dockerRequest(dockerApi, "POST", "/containers/create?name=" + scn.name,
+                           scn.createBody, cr);
+    Status::info("d:created=" + String(cc));
+    if (cc == 201 || cc == 200) {
+      JsonDocument crd;
+      deserializeJson(crd, cr);
+      newId = crd["Id"].as<String>();
+      if (!newId.length()) fail = "create no id";
     } else {
-      Status::error("update " + name + ": " + e);
+      fail = String("create HTTP ") + cc;
+    }
+
+    if (!fail.length()) {
+      for (auto& en : scn.extraNets) {
+        JsonDocument cb;
+        cb["Container"] = newId;
+        JsonDocument ep;
+        deserializeJson(ep, en.second);
+        cb["EndpointConfig"] = ep;
+        String cbs, rr;
+        serializeJson(cb, cbs);
+        dockerRequest(dockerApi, "POST", "/networks/" + en.first + "/connect", cbs, rr);
+      }
+      Status::info("d:start");
+      int scode = dockerRequest(dockerApi, "POST", "/containers/" + newId + "/start", "", r);
+      if (scode != 204 && scode != 200) fail = String("start HTTP ") + scode;
+    }
+
+    if (!fail.length()) {
+      // New container is up: discard the parked old one.
+      dockerRequest(dockerApi, "DELETE", "/containers/" + scn.id + "?force=1", "", r);
+      Status::event("Updated " + scn.name);
+      ++started;
+    } else {
+      // Roll back: drop the failed new container, restore the old one, restart it.
+      if (newId.length())
+        dockerRequest(dockerApi, "DELETE", "/containers/" + newId + "?force=1", "", r);
+      dockerRequest(dockerApi, "POST", "/containers/" + scn.id + "/rename?name=" + scn.name, "", r);
+      dockerRequest(dockerApi, "POST", "/containers/" + scn.id + "/start", "", r);
+      Status::error("rollback " + scn.name + ": " + fail);
     }
   }
-  return updated;
+  return started;
 }
 
 }  // namespace DockerClient

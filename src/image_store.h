@@ -14,6 +14,9 @@ namespace ImageStore {
 bool begin();
 String dirFor(const ImageRef& ref);
 bool isComplete(const ImageRef& ref);
+// Manifest digest (bare hex) of the cached image, i.e. what it was pulled as;
+// empty if not cached. Used to detect a moved mutable tag like `latest`.
+String cachedDigest(const ImageRef& ref);
 bool markComplete(const ImageRef& ref);
 bool removeImage(const ImageRef& ref);
 bool ensureDir(const String& path);

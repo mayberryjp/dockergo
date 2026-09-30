@@ -17,4 +17,8 @@ void setProxy(const String& proxyBase);
 // Pull an image into the SD OCI-layout cache (see SPEC §6). `platform` is like
 // "linux/amd64" and selects an entry from a multi-arch manifest index.
 PullResult pull(const ImageRef& ref, const String& platform);
+// Resolve the tag's current image-manifest digest (bare hex) for `platform`,
+// matching what pull() stores, so a mutable tag can be checked for changes
+// without downloading blobs.
+bool resolveDigest(const ImageRef& ref, const String& platform, String& outHex, String& err);
 }  // namespace RegistryClient

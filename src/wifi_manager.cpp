@@ -24,6 +24,7 @@ const std::vector<ScanEntry>& WifiManager::scan() {
   std::sort(_last.begin(), _last.end(),
             [](const ScanEntry& a, const ScanEntry& b) { return a.rssi > b.rssi; });
   Status::info(String("Found ") + _last.size() + " APs");
+  for (const auto& e : _last) Status::info(String("AP ") + e.ssid + " " + e.rssi + "dBm");
   return _last;
 }
 

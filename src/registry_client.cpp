@@ -476,6 +476,36 @@ namespace RegistryClient {
 
 void setProxy(const String& proxyBase) { s_proxy = proxyBase; }
 
+bool resolveDigest(const ImageRef& ref, const String& platform, String& outHex, String& err) {
+  if (!s_proxy.length()) {
+    err = "no proxy configured";
+    return false;
+  }
+  String token;
+  if (!getAuthToken(ref, token, err)) {
+    err = "auth: " + err;
+    return false;
+  }
+  String body, ctype;
+  if (!fetchManifest(ref, ref.manifestRef(), token, body, ctype, err)) return false;
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) {
+    err = "manifest parse";
+    return false;
+  }
+  if (doc["manifests"].is<JsonArray>()) {  // index -> pick this platform's manifest
+    String sub = selectFromIndex(doc, platform);
+    if (!sub.length()) {
+      err = "no manifest for " + platform;
+      return false;
+    }
+    if (!fetchManifest(ref, sub, token, body, ctype, err)) return false;
+  }
+  // Same hash pull() records as manifestDigestHex, so the two are comparable.
+  outHex = sha256Hex((const uint8_t*)body.c_str(), body.length());
+  return true;
+}
+
 PullResult pull(const ImageRef& ref, const String& platform) {
   PullResult res;
   res.imageDir = ImageStore::dirFor(ref);

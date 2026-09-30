@@ -28,7 +28,7 @@ SummaryResult fetch(const String& url) {
 
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
-    r.error = String("HTTP ") + code;
+    r.error = String("HTTP ") + code + (code < 0 ? " " + HTTPClient::errorToString(code) : String(""));
     http.end();
     return r;
   }

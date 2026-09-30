@@ -32,7 +32,12 @@ void Orchestrator::runCycle() {
   for (const auto& site : _cfg->sites) {
     if (home && &site == home) continue;
     if (site.home) continue;
-    if (_wifi->isVisible(site.ssid)) doRemote(site);
+    if (_wifi->isVisible(site.ssid)) {
+      Status::info(site.name + " visible " + _wifi->rssiOf(site.ssid) + "dBm");
+      doRemote(site);
+    } else {
+      Status::info(site.name + " not seen: " + site.ssid);
+    }
   }
 
   Status::stage(DeviceState::Idle, "Idle");
@@ -73,9 +78,20 @@ void Orchestrator::doHome(const SiteConfig& home) {
       continue;
     }
     if (ImageStore::isComplete(ref)) {
-      ++have;
-      Status::info("cached " + ref.shortName());
-      continue;
+      bool fresh = true;  // assume cached copy is current
+      if (!ref.digest.length()) {  // mutable tag: verify it hasn't moved upstream
+        String cur, derr;
+        if (RegistryClient::resolveDigest(ref, platform, cur, derr))
+          fresh = cur == ImageStore::cachedDigest(ref);
+        else
+          Status::info("check " + ref.shortName() + ": " + derr);  // keep cache on error
+      }
+      if (fresh) {
+        ++have;
+        Status::info("cached " + ref.shortName());
+        continue;
+      }
+      Status::info("changed " + ref.shortName());
     }
     Status::stage(DeviceState::Working, ref.original);
     PullResult pr = RegistryClient::pull(ref, platform);
@@ -99,6 +115,7 @@ void Orchestrator::doRemote(const SiteConfig& site) {
     return;
   }
   Status::stage(DeviceState::Remote, site.name);
+  Status::info("api " + site.dockerApi);
 
   SummaryResult sum = SummaryClient::fetch(site.summaryUrl);
   if (!sum.ok) {
@@ -106,6 +123,7 @@ void Orchestrator::doRemote(const SiteConfig& site) {
     _wifi->disconnect();
     return;
   }
+  Status::info(String("pending ") + sum.pendingImages.size());
 
   int applied = 0, missing = 0, fail = 0;
   for (const auto& imgStr : sum.pendingImages) {
@@ -118,17 +136,13 @@ void Orchestrator::doRemote(const SiteConfig& site) {
     }
     Status::stage(DeviceState::Working, "UP " + ref.shortName());
     String err;
-    if (!DockerClient::loadImage(site.dockerApi, ImageStore::dirFor(ref), err)) {
+    int n = DockerClient::deployImage(site.dockerApi, ref, ImageStore::dirFor(ref), err);
+    if (n < 0) {
       ++fail;
-      Status::error("load " + ref.shortName() + ": " + err);
+      Status::error("deploy " + ref.shortName() + ": " + err);
       continue;
     }
     Status::event("Loaded " + ref.original + " @ " + site.name);
-    int n = DockerClient::updateContainersForImage(site.dockerApi, ref, err);
-    if (n < 0)
-      Status::error("update: " + err);
-    else if (n == 0)
-      Status::info("no container for " + ref.shortName());
     ++applied;
   }
   Status::event(site.name + ": applied " + applied + " miss " + missing + " fail " + fail);

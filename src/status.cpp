@@ -1,6 +1,7 @@
 #include "status.h"
 
 #include <SD_MMC.h>
+#include <esp_system.h>
 
 #include "discord_client.h"
 
@@ -8,6 +9,25 @@ namespace {
 StatusDisplay* g_display = nullptr;
 DiscordClient* g_discord = nullptr;
 bool g_sdLog = false;
+
+// Last-reset cause. Logged in the boot marker because the SD log records only
+// Status:: lines, never the panic handler, so a crash leaves no trace here on
+// its own -- this is the only way to tell brownout vs watchdog vs panic apart.
+const char* resetReasonStr() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON: return "POWERON";
+    case ESP_RST_EXT: return "EXT";
+    case ESP_RST_SW: return "SW";
+    case ESP_RST_PANIC: return "PANIC";
+    case ESP_RST_INT_WDT: return "INT_WDT";
+    case ESP_RST_TASK_WDT: return "TASK_WDT";
+    case ESP_RST_WDT: return "WDT";
+    case ESP_RST_BROWNOUT: return "BROWNOUT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_SDIO: return "SDIO";
+    default: return "UNKNOWN";
+  }
+}
 
 void toSerial(const char* level, const String& s) {
   Serial.printf("[%s] %s\n", level, s.c_str());
@@ -33,9 +53,12 @@ void begin(StatusDisplay* display, DiscordClient* discord) {
 }
 
 void beginSdLog() {
-  fs::File f = SD_MMC.open("/dockergo.log", FILE_WRITE);  // fresh log each boot
+  // Append across boots so an unattended crash isn't erased by the next power-up;
+  // the boot marker delimits each session in the growing log.
+  fs::File f = SD_MMC.open("/dockergo.log", FILE_APPEND);
   if (f) {
-    f.printf("--- boot %lu heap=%u ---\n", (unsigned long)millis(), (unsigned)ESP.getFreeHeap());
+    f.printf("--- boot %lu heap=%u rst=%s ---\n", (unsigned long)millis(),
+             (unsigned)ESP.getFreeHeap(), resetReasonStr());
     f.close();
   }
   g_sdLog = true;

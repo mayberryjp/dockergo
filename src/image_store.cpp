@@ -50,6 +50,17 @@ String dirFor(const ImageRef& ref) { return String(kBase) + "/" + ref.safeId(); 
 
 bool isComplete(const ImageRef& ref) { return SD_MMC.exists(dirFor(ref) + "/.complete"); }
 
+String cachedDigest(const ImageRef& ref) {
+  // refs line 1 is the image manifest digest (RegistryClient::pull writes it
+  // first), so it names the exact cached image without parsing index.json.
+  File f = SD_MMC.open(dirFor(ref) + "/" + kRefs, FILE_READ);
+  if (!f) return "";
+  String h = f.readStringUntil('\n');
+  f.close();
+  h.trim();
+  return h;
+}
+
 bool markComplete(const ImageRef& ref) {
   File f = SD_MMC.open(dirFor(ref) + "/.complete", FILE_WRITE);
   if (!f) return false;
