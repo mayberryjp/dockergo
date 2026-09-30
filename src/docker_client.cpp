@@ -306,10 +306,23 @@ bool loadImage(const String& dockerApi, const String& imageDir, String& err) {
   size_t sent = 0, lastShown = 0;
   int blobIdx = 0;
 
+  // WiFiClient::write can accept fewer bytes than asked under TCP backpressure;
+  // loop until every byte is flushed so the tar stream matches the sizes declared
+  // in the headers. A short write here would misalign the whole archive.
+  auto writeFully = [&](const uint8_t* p, size_t n) -> bool {
+    size_t off = 0;
+    while (off < n) {
+      int w = client.write(p + off, n - off);
+      if (w <= 0) return false;
+      off += (size_t)w;
+    }
+    return true;
+  };
+
   for (auto& e : entries) {
     buildTarHeader(hdr, e.tarName, e.size);
-    if (client.write(hdr, 512) != 512) {
-      err = "socket write";
+    if (!writeFully(hdr, 512)) {
+      err = "tar header write";
       client.stop();
       return false;
     }
@@ -323,8 +336,18 @@ bool loadImage(const String& dockerApi, const String& imageDir, String& err) {
     while (remaining) {
       size_t toRead = remaining < sizeof(buf) ? remaining : sizeof(buf);
       int n = f.read(buf, toRead);
-      if (n <= 0) break;
-      client.write(buf, n);
+      if (n <= 0) {  // short/failed read would truncate the entry and corrupt the tar
+        f.close();
+        err = "short read " + e.tarName;
+        client.stop();
+        return false;
+      }
+      if (!writeFully(buf, n)) {
+        f.close();
+        err = "blob write " + e.tarName;
+        client.stop();
+        return false;
+      }
       remaining -= n;
       sent += n;
       if (payloadBytes && (sent - lastShown) >= 65536) {
@@ -334,14 +357,21 @@ bool loadImage(const String& dockerApi, const String& imageDir, String& err) {
     }
     f.close();
     size_t pad = (512 - (e.size % 512)) % 512;
-    if (pad) client.write(zeros, pad);
+    if (pad && !writeFully(zeros, pad)) {
+      err = "pad write";
+      client.stop();
+      return false;
+    }
     if (e.tarName.startsWith("blobs/sha256/")) {
       ++blobIdx;
       Status::event(String("blob ") + blobIdx + "/" + blobCount + " up " + humanBytes(e.size));
     }
   }
-  client.write(zeros, 512);
-  client.write(zeros, 512);
+  if (!writeFully(zeros, 512) || !writeFully(zeros, 512)) {
+    err = "tar tail write";
+    client.stop();
+    return false;
+  }
   Status::clearProgress();
 
   String statusLine = client.readStringUntil('\n');
@@ -476,11 +506,8 @@ int deployImage(const String& dockerApi, const ImageRef& ref, const String& imag
     // than deleting it; clear any stale backup from an interrupted run first.
     String r;
     String backup = scn.name + "_old";
-    Status::info("d:stop " + scn.name);
     dockerRequest(dockerApi, "POST", "/containers/" + scn.id + "/stop?t=10", "", r);
-    Status::info("d:delbak");
     dockerRequest(dockerApi, "DELETE", "/containers/" + backup + "?force=1", "", r);
-    Status::info("d:rename");
     int rn = dockerRequest(dockerApi, "POST",
                            "/containers/" + scn.id + "/rename?name=" + backup, "", r);
     if (rn != 204 && rn != 200) {
@@ -489,11 +516,9 @@ int deployImage(const String& dockerApi, const ImageRef& ref, const String& imag
       continue;
     }
 
-    Status::info("d:create body=" + String(scn.createBody.length()));
     String fail, newId, cr;
     int cc = dockerRequest(dockerApi, "POST", "/containers/create?name=" + scn.name,
                            scn.createBody, cr);
-    Status::info("d:created=" + String(cc));
     if (cc == 201 || cc == 200) {
       JsonDocument crd;
       deserializeJson(crd, cr);
@@ -514,7 +539,6 @@ int deployImage(const String& dockerApi, const ImageRef& ref, const String& imag
         serializeJson(cb, cbs);
         dockerRequest(dockerApi, "POST", "/networks/" + en.first + "/connect", cbs, rr);
       }
-      Status::info("d:start");
       int scode = dockerRequest(dockerApi, "POST", "/containers/" + newId + "/start", "", r);
       if (scode != 204 && scode != 200) fail = String("start HTTP ") + scode;
     }
