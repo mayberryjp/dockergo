@@ -33,6 +33,7 @@ bool loadFromSd(const char* path, AppConfig& out, String& err) {
   out = AppConfig{};
   if (doc["device_name"].is<const char*>()) out.deviceName = doc["device_name"].as<String>();
   if (doc["image_platform"].is<const char*>()) out.imagePlatform = doc["image_platform"].as<String>();
+  if (doc["proxy"].is<const char*>()) out.proxy = doc["proxy"].as<String>();
   if (doc["discord_webhook"].is<const char*>()) out.discordWebhook = doc["discord_webhook"].as<String>();
 
   JsonArray sites = doc["sites"].as<JsonArray>();

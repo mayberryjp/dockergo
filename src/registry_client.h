@@ -11,6 +11,9 @@ struct PullResult {
 };
 
 namespace RegistryClient {
+// All registry traffic routes through this HTTP proxy ("http://host:port"); the
+// device speaks plain HTTP and the proxy terminates TLS to the real registry.
+void setProxy(const String& proxyBase);
 // Pull an image into the SD OCI-layout cache (see SPEC §6). `platform` is like
 // "linux/amd64" and selects an entry from a multi-arch manifest index.
 PullResult pull(const ImageRef& ref, const String& platform);

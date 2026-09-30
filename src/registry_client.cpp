@@ -5,7 +5,6 @@
 #include <SD_MMC.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
-#include <WiFiClientSecure.h>
 
 #include <vector>
 
@@ -85,6 +84,32 @@ String extractAuthParam(const String& header, const String& key) {
   return header.substring(i, j);
 }
 
+// --- HTTP proxy ---
+// The device speaks only plain HTTP to the proxy; the real upstream host travels
+// in X-Upstream and the proxy terminates TLS to the registry / signed CDN.
+String s_proxy;  // e.g. "http://192.168.1.10:8080"
+
+void splitUrl(const String& url, String& host, String& path) {
+  int h = url.indexOf("://");
+  h = (h < 0) ? 0 : h + 3;
+  int p = url.indexOf('/', h);
+  if (p < 0) {
+    host = url.substring(h);
+    path = "/";
+  } else {
+    host = url.substring(h, p);
+    path = url.substring(p);
+  }
+}
+
+bool beginProxied(HTTPClient& http, WiFiClient& client, const String& host, const String& path) {
+  if (!s_proxy.length()) return false;
+  if (!http.begin(client, s_proxy + path)) return false;
+  http.addHeader("X-Upstream", host);
+  http.addHeader("User-Agent", DOCKERGO_UA);
+  return true;
+}
+
 // Stream sink: writes incoming bytes to an SD file while hashing them, and
 // throttles an LCD progress bar against a known expected size.
 class HashingFileSink : public Stream {
@@ -146,22 +171,18 @@ class HashingFileSink : public Stream {
   mbedtls_sha256_context _ctx;
 };
 
-bool httpGetToSink(const String& url, const String& bearer, HashingFileSink& sink,
-                   String& err, int depth = 0) {
-  if (depth > 3) {
+bool httpGetToSink(const String& host, const String& path, const String& bearer,
+                   HashingFileSink& sink, String& err, int depth = 0) {
+  if (depth > 5) {
     err = "too many redirects";
     return false;
   }
-  const bool https = url.startsWith("https");
-  WiFiClient plain;
-  WiFiClientSecure secure;
+  WiFiClient client;
   HTTPClient http;
-  bool ok = https ? (configureTls(secure), http.begin(secure, url)) : http.begin(plain, url);
-  if (!ok) {
+  if (!beginProxied(http, client, host, path)) {
     err = "begin failed";
     return false;
   }
-  http.addHeader("User-Agent", DOCKERGO_UA);
   http.addHeader("Accept", "*/*");
   if (bearer.length()) http.addHeader("Authorization", "Bearer " + bearer);
   const char* keys[] = {"Location"};
@@ -187,17 +208,30 @@ bool httpGetToSink(const String& url, const String& bearer, HashingFileSink& sin
       err = "redirect without Location";
       return false;
     }
-    // Registry blob redirects to signed storage URLs — drop the bearer token.
-    return httpGetToSink(loc, "", sink, err, depth + 1);
+    // Caddy relays the upstream redirect; re-drive it through the proxy. Absolute
+    // Location -> new upstream host; relative -> same host. Drop bearer (signed URL).
+    String nhost = host, npath;
+    if (loc.startsWith("/"))
+      npath = loc;
+    else
+      splitUrl(loc, nhost, npath);
+    return httpGetToSink(nhost, npath, "", sink, err, depth + 1);
   }
-  err = String("HTTP ") + code;
+  err = String("HTTP ") + code + " @ " + host;
   http.end();
   return false;
 }
 
+bool getAuthToken(const ImageRef& ref, String& token, String& err);
+
 // Download a blob into the shared content-addressed store and verify its digest.
+// Transient failures (dropped TLS stream, read timeout, truncated body) and an
+// expired anonymous token (HTTP 401 mid-pull) are retried a few times so a single
+// blip no longer aborts a multi-GB image. On 401 the token is re-minted and written
+// back through `bearer`, so every later layer carries the fresh one. Completed blobs
+// are skipped up front, so a retry only re-fetches the one layer that failed.
 bool downloadBlob(const ImageRef& ref, const String& digest, size_t size,
-                  const String& bearer, const String& label, const String& caption,
+                  String& bearer, const String& label, const String& caption,
                   String& err) {
   String want = stripDigest(digest);
   String dest = ImageStore::blobPath(want);
@@ -207,47 +241,59 @@ bool downloadBlob(const ImageRef& ref, const String& digest, size_t size,
   // images, so a layer any image already pulled is reused instead of re-downloaded.
   if (SD_MMC.exists(dest)) return true;
 
-  // Stream to a temp file; an interrupted pull leaves <digest>.part, never a
-  // short file masquerading as a complete blob on the next run.
-  String tmp = dest + ".part";
-  File f = SD_MMC.open(tmp, FILE_WRITE);
-  if (!f) {
-    err = "open " + tmp;
-    return false;
-  }
-  HashingFileSink sink(f, size, caption);
-  String url = "https://" + ref.registryHost + "/v2/" + ref.repo + "/blobs/" + digest;
-  bool ok = httpGetToSink(url, bearer, sink, err);
-  String got = sink.hexDigest();
-  f.close();
-  Status::clearProgress();
-  if (!ok) {
+  String path = "/v2/" + ref.repo + "/blobs/" + digest;
+
+  const int kMaxAttempts = 4;
+  for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
+    // Stream to a temp file; an interrupted pull leaves <digest>.part, never a
+    // short file masquerading as a complete blob on the next run.
+    String tmp = dest + ".part";
+    File f = SD_MMC.open(tmp, FILE_WRITE);
+    if (!f) {
+      err = "open " + tmp;
+      return false;
+    }
+    HashingFileSink sink(f, size, caption);
+    bool ok = httpGetToSink(ref.registryHost, path, bearer, sink, err);
+    String got = sink.hexDigest();
+    f.close();
+    Status::clearProgress();
+
+    if (ok && got.equalsIgnoreCase(want)) {
+      if (!SD_MMC.rename(tmp, dest)) {
+        SD_MMC.remove(tmp);
+        err = "rename " + label;
+        return false;
+      }
+      return true;
+    }
+
+    // Failure: discard the partial and (unless out of tries) go around again.
+    // A clean transfer that hashed wrong is a truncated body — also transient.
     SD_MMC.remove(tmp);
-    return false;
+    if (ok) err = "digest mismatch " + label;
+    if (attempt == kMaxAttempts) break;
+
+    // A 401 means the anonymous token expired mid-pull; mint a fresh one so this
+    // retry and every later layer carry a valid bearer.
+    if (err.endsWith("401")) {
+      String fresh, terr;
+      if (getAuthToken(ref, fresh, terr) && fresh.length()) bearer = fresh;
+    }
+    Status::info(label + " retry " + attempt + ": " + err);
+    delay(400 * attempt);
   }
-  if (!got.equalsIgnoreCase(want)) {
-    SD_MMC.remove(tmp);
-    err = "digest mismatch " + label;
-    return false;
-  }
-  if (!SD_MMC.rename(tmp, dest)) {
-    SD_MMC.remove(tmp);
-    err = "rename " + label;
-    return false;
-  }
-  return true;
+  return false;
 }
 
 bool getAuthToken(const ImageRef& ref, String& token, String& err) {
   token = "";
-  WiFiClientSecure c;
-  configureTls(c);
+  WiFiClient client;
   HTTPClient http;
-  if (!http.begin(c, "https://" + ref.registryHost + "/v2/")) {
+  if (!beginProxied(http, client, ref.registryHost, "/v2/")) {
     err = "v2 begin";
     return false;
   }
-  http.addHeader("User-Agent", DOCKERGO_UA);
   const char* keys[] = {"WWW-Authenticate"};
   http.collectHeaders(keys, 1);
   int code = http.GET();
@@ -266,17 +312,18 @@ bool getAuthToken(const ImageRef& ref, String& token, String& err) {
     err = "no auth realm";
     return false;
   }
-  String tokenUrl = realm + "?service=" + urlEncode(service) +
-                    "&scope=" + urlEncode("repository:" + ref.repo + ":pull");
+  // realm is an absolute URL (e.g. https://auth.docker.io/token); reach it via the proxy too.
+  String authHost, authPath;
+  splitUrl(realm, authHost, authPath);
+  String tokenPath = authPath + "?service=" + urlEncode(service) +
+                     "&scope=" + urlEncode("repository:" + ref.repo + ":pull");
 
-  WiFiClientSecure c2;
-  configureTls(c2);
+  WiFiClient client2;
   HTTPClient http2;
-  if (!http2.begin(c2, tokenUrl)) {
+  if (!beginProxied(http2, client2, authHost, tokenPath)) {
     err = "token begin";
     return false;
   }
-  http2.addHeader("User-Agent", DOCKERGO_UA);
   int code2 = http2.GET();
   if (code2 != HTTP_CODE_OK) {
     err = String("token HTTP ") + code2;
@@ -306,15 +353,13 @@ bool getAuthToken(const ImageRef& ref, String& token, String& err) {
 
 bool fetchManifest(const ImageRef& ref, const String& reference, const String& bearer,
                    String& body, String& contentType, String& err) {
-  WiFiClientSecure c;
-  configureTls(c);
+  WiFiClient client;
   HTTPClient http;
-  String url = "https://" + ref.registryHost + "/v2/" + ref.repo + "/manifests/" + reference;
-  if (!http.begin(c, url)) {
+  String path = "/v2/" + ref.repo + "/manifests/" + reference;
+  if (!beginProxied(http, client, ref.registryHost, path)) {
     err = "manifest begin";
     return false;
   }
-  http.addHeader("User-Agent", DOCKERGO_UA);
   http.addHeader("Accept", kManifestAccept);
   if (bearer.length()) http.addHeader("Authorization", "Bearer " + bearer);
   const char* keys[] = {"Content-Type"};
@@ -375,9 +420,15 @@ bool writeTextFile(const String& path, const String& content) {
 
 namespace RegistryClient {
 
+void setProxy(const String& proxyBase) { s_proxy = proxyBase; }
+
 PullResult pull(const ImageRef& ref, const String& platform) {
   PullResult res;
   res.imageDir = ImageStore::dirFor(ref);
+  if (!s_proxy.length()) {
+    res.error = "no proxy configured";
+    return res;
+  }
 
   String token, err;
   if (!getAuthToken(ref, token, err)) {
@@ -469,7 +520,7 @@ PullResult pull(const ImageRef& ref, const String& platform) {
     size_t sz = layer["size"] | 0;
     String label = String("layer ") + idx + "/" + res.layerCount;
     String cap = String("L") + idx + "/" + res.layerCount;
-    Status::info(label + " " + d.substring(7, 19));
+    Status::event(label + " start " + humanBytes(sz));
     if (!downloadBlob(ref, d, sz, token, label, cap, err)) {
       res.error = err;
       return res;

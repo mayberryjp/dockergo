@@ -12,6 +12,7 @@
 void Orchestrator::begin(AppConfig* cfg, WifiManager* wifi) {
   _cfg = cfg;
   _wifi = wifi;
+  RegistryClient::setProxy(cfg->proxy);
 }
 
 void Orchestrator::runCycle() {
@@ -74,7 +75,7 @@ void Orchestrator::doHome(const SiteConfig& home) {
       Status::info("cached " + ref.shortName());
       continue;
     }
-    Status::stage(DeviceState::Working, "DL " + ref.shortName());
+    Status::stage(DeviceState::Working, "DL " + ref.original);
     PullResult pr = RegistryClient::pull(ref, platform);
     if (pr.ok) {
       ImageStore::markComplete(ref);
@@ -82,7 +83,7 @@ void Orchestrator::doHome(const SiteConfig& home) {
       Status::event("Downloaded " + ref.original);
     } else {
       ++fail;
-      Status::error("DL " + ref.shortName() + ": " + pr.error);
+      Status::error("DL " + ref.original + ": " + pr.error);
     }
   }
   Status::event(String("HOME: +") + got + " have " + have + " fail " + fail);

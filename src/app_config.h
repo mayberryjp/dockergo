@@ -16,6 +16,7 @@ struct SiteConfig {
 struct AppConfig {
   String deviceName = "dockergo";
   String imagePlatform = "linux/amd64";
+  String proxy;  // http://host:port Caddy proxy; registry pulls route through it
   String discordWebhook;
   std::vector<SiteConfig> sites;
 
