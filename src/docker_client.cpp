@@ -348,6 +348,16 @@ int updateContainersForImage(const String& dockerApi, const ImageRef& ref, Strin
     return -1;
   }
 
+  // Resolve the freshly-loaded image's ID so we can skip containers already on it.
+  String newImageId;
+  {
+    String imgBody;
+    if (dockerRequest(dockerApi, "GET", "/images/" + ref.original + "/json", "", imgBody) == 200) {
+      JsonDocument idoc;
+      if (!deserializeJson(idoc, imgBody)) newImageId = idoc["Id"].as<String>();
+    }
+  }
+
   std::vector<String> cands = matchCandidates(ref);
   int updated = 0;
   for (JsonObject cont : doc.as<JsonArray>()) {
@@ -363,6 +373,12 @@ int updateContainersForImage(const String& dockerApi, const ImageRef& ref, Strin
     String id = cont["Id"].as<String>();
     String name = cont["Names"][0].as<String>();
     if (name.startsWith("/")) name = name.substring(1);
+
+    // Idempotent: leave containers already running the loaded image untouched.
+    if (newImageId.length() && cont["ImageID"].as<String>() == newImageId) {
+      Status::info("up-to-date " + name);
+      continue;
+    }
 
     Status::info("recreate " + name);
     String e;

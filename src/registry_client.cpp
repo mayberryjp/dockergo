@@ -110,19 +110,19 @@ bool beginProxied(HTTPClient& http, WiFiClient& client, const String& host, cons
   return true;
 }
 
-// Stream sink: writes incoming bytes to an SD file while hashing them, and
-// throttles an LCD progress bar against a known expected size.
-class HashingFileSink : public Stream {
+// Writes incoming bytes to an already-open SD file and throttles an LCD progress
+// bar. Hashing is done separately (hashFile) so a transfer can resume across a
+// dropped connection without carrying SHA state between attempts. `base` is the
+// byte count already on disk from earlier attempts, so the bar shows cumulative
+// progress and live rate.
+class ProgressFileSink : public Stream {
  public:
-  HashingFileSink(File f, size_t expected, const String& caption)
-      : _f(f), _expected(expected), _caption(caption) {
-    mbedtls_sha256_init(&_ctx);
-    mbedtls_sha256_starts(&_ctx, 0);
+  ProgressFileSink(File& f, size_t expected, const String& caption, size_t base)
+      : _f(f), _expected(expected), _caption(caption), _total(base), _lastBytes(base) {
     _lastMs = millis();
   }
   size_t write(uint8_t b) override { return write(&b, 1); }
   size_t write(const uint8_t* buf, size_t n) override {
-    mbedtls_sha256_update(&_ctx, buf, n);
     size_t w = _f.write(buf, n);
     _total += w;
     // Refresh on a time cadence, not per-chunk, so the bar + rate keep moving
@@ -134,14 +134,6 @@ class HashingFileSink : public Stream {
   int available() override { return 0; }
   int read() override { return -1; }
   int peek() override { return -1; }
-
-  String hexDigest() {
-    uint8_t out[32];
-    mbedtls_sha256_finish(&_ctx, out);
-    mbedtls_sha256_free(&_ctx);
-    return toHex(out, 32);
-  }
-  size_t total() const { return _total; }
 
  private:
   void report(uint32_t now) {
@@ -162,17 +154,43 @@ class HashingFileSink : public Stream {
     Status::progress(line, pct);
   }
 
-  File _f;
+  File& _f;
   size_t _expected;
   String _caption;
-  size_t _total = 0;
+  size_t _total;
   uint32_t _lastMs = 0;
-  size_t _lastBytes = 0;
-  mbedtls_sha256_context _ctx;
+  size_t _lastBytes;
 };
 
-bool httpGetToSink(const String& host, const String& path, const String& bearer,
-                   HashingFileSink& sink, String& err, int depth = 0) {
+// Hash a finished blob file by reading it back. Keeps SHA state out of the
+// resumable transfer path, so a dropped connection never invalidates progress.
+String hashFile(const String& path) {
+  File f = SD_MMC.open(path, FILE_READ);
+  if (!f) return "";
+  mbedtls_sha256_context c;
+  mbedtls_sha256_init(&c);
+  mbedtls_sha256_starts(&c, 0);
+  static uint8_t buf[2048];  // single-threaded pulls; keep it off the small task stack
+  for (;;) {
+    int n = f.read(buf, sizeof(buf));
+    if (n <= 0) break;
+    mbedtls_sha256_update(&c, buf, (size_t)n);
+  }
+  f.close();
+  uint8_t out[32];
+  mbedtls_sha256_finish(&c, out);
+  mbedtls_sha256_free(&c);
+  return toHex(out, 32);
+}
+
+// Fetch [rangeStart..] of a blob into `tmp`, following the proxy's redirect to the
+// signed CDN. A 206 appends (resume); a 200 (origin ignored Range) truncates and
+// writes from zero, so a non-range-capable origin can't corrupt the file. Partial
+// data may remain in `tmp` on error, letting the caller resume from tmp's size.
+bool fetchBlobRange(const String& host, const String& path, const String& bearer,
+                    const String& tmp, size_t rangeStart, size_t expected,
+                    const String& caption, String& err, int depth = 0) {
+  err = "";
   if (depth > 5) {
     err = "too many redirects";
     return false;
@@ -185,22 +203,14 @@ bool httpGetToSink(const String& host, const String& path, const String& bearer,
   }
   http.addHeader("Accept", "*/*");
   if (bearer.length()) http.addHeader("Authorization", "Bearer " + bearer);
+  if (rangeStart) http.addHeader("Range", "bytes=" + String((uint32_t)rangeStart) + "-");
   const char* keys[] = {"Location"};
   http.collectHeaders(keys, 1);
   http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
   http.setConnectTimeout(10000);
-  http.setTimeout(15000);
+  http.setTimeout(20000);
 
   int code = http.GET();
-  if (code == HTTP_CODE_OK) {
-    int r = http.writeToStream(&sink);
-    http.end();
-    if (r < 0) {
-      err = "stream error";
-      return false;
-    }
-    return true;
-  }
   if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
     String loc = http.header("Location");
     http.end();
@@ -208,28 +218,54 @@ bool httpGetToSink(const String& host, const String& path, const String& bearer,
       err = "redirect without Location";
       return false;
     }
-    // Caddy relays the upstream redirect; re-drive it through the proxy. Absolute
-    // Location -> new upstream host; relative -> same host. Drop bearer (signed URL).
+    // Caddy relays the upstream redirect; re-drive through the proxy, carrying the
+    // Range so the resume survives the hop. Absolute Location -> new host; relative
+    // -> same host. Drop bearer (the CDN URL is already signed).
     String nhost = host, npath;
     if (loc.startsWith("/"))
       npath = loc;
     else
       splitUrl(loc, nhost, npath);
-    return httpGetToSink(nhost, npath, "", sink, err, depth + 1);
+    return fetchBlobRange(nhost, npath, "", tmp, rangeStart, expected, caption, err, depth + 1);
   }
-  err = String("HTTP ") + code + " @ " + host;
+  const bool partial = (code == 206);
+  const bool full = (code == HTTP_CODE_OK);
+  if (!partial && !full) {
+    err = String("HTTP ") + code + " @ " + host;
+    http.end();
+    return false;
+  }
+
+  // 206 from a real resume appends; anything else (including an origin that ignored
+  // Range and sent the whole object) rewrites from the start.
+  const bool resume = partial && rangeStart > 0;
+  File f = SD_MMC.open(tmp, resume ? FILE_APPEND : FILE_WRITE);
+  if (!f) {
+    err = "open " + tmp;
+    http.end();
+    return false;
+  }
+  ProgressFileSink sink(f, expected, caption, resume ? rangeStart : 0);
+  int r = http.writeToStream(&sink);
+  f.close();
   http.end();
-  return false;
+  Status::clearProgress();
+  if (r < 0) {
+    err = "stream error";
+    return false;
+  }
+  return true;
 }
 
 bool getAuthToken(const ImageRef& ref, String& token, String& err);
 
 // Download a blob into the shared content-addressed store and verify its digest.
-// Transient failures (dropped TLS stream, read timeout, truncated body) and an
-// expired anonymous token (HTTP 401 mid-pull) are retried a few times so a single
-// blip no longer aborts a multi-GB image. On 401 the token is re-minted and written
-// back through `bearer`, so every later layer carries the fresh one. Completed blobs
-// are skipped up front, so a retry only re-fetches the one layer that failed.
+// Large layers are fetched with HTTP Range, so a dropped connection resumes from
+// the bytes already on SD instead of restarting from zero, and a 401 mid-pull
+// re-mints the anonymous token (written back through `bearer` for every later
+// layer). The budget counts only rounds that make NO forward progress, so a flaky
+// link keeps going as long as bytes keep landing. Completed blobs are skipped up
+// front; a resume only re-fetches the missing tail of the one layer that failed.
 bool downloadBlob(const ImageRef& ref, const String& digest, size_t size,
                   String& bearer, const String& label, const String& caption,
                   String& err) {
@@ -242,24 +278,52 @@ bool downloadBlob(const ImageRef& ref, const String& digest, size_t size,
   if (SD_MMC.exists(dest)) return true;
 
   String path = "/v2/" + ref.repo + "/blobs/" + digest;
+  // A .part left by an earlier attempt/cycle for THIS digest is a genuine prefix of
+  // this exact blob (the path is content-addressed), so it is safe to resume; the
+  // final re-hash catches any corruption and restarts clean.
+  String tmp = dest + ".part";
 
-  const int kMaxAttempts = 4;
-  for (int attempt = 1; attempt <= kMaxAttempts; ++attempt) {
-    // Stream to a temp file; an interrupted pull leaves <digest>.part, never a
-    // short file masquerading as a complete blob on the next run.
-    String tmp = dest + ".part";
-    File f = SD_MMC.open(tmp, FILE_WRITE);
-    if (!f) {
-      err = "open " + tmp;
-      return false;
+  auto partSize = [&]() -> size_t {
+    File pf = SD_MMC.open(tmp, FILE_READ);
+    if (!pf) return 0;
+    size_t n = pf.size();
+    pf.close();
+    return n;
+  };
+
+  const int kMaxStalls = 5;  // consecutive no-progress rounds before giving up
+  int stalls = 0;
+  for (;;) {
+    size_t have = partSize();
+    if (size && have > size) {  // overrun from a botched write -> start clean
+      SD_MMC.remove(tmp);
+      have = 0;
     }
-    HashingFileSink sink(f, size, caption);
-    bool ok = httpGetToSink(ref.registryHost, path, bearer, sink, err);
-    String got = sink.hexDigest();
-    f.close();
-    Status::clearProgress();
 
-    if (ok && got.equalsIgnoreCase(want)) {
+    if (!size || have < size) {
+      bool ok = fetchBlobRange(ref.registryHost, path, bearer, tmp, have, size, caption, err);
+      // A 401 means the anonymous token expired mid-pull; mint a fresh one so this
+      // resume and every later layer carry a valid bearer.
+      if (!ok && err.startsWith("HTTP 401")) {
+        String fresh, terr;
+        if (getAuthToken(ref, fresh, terr) && fresh.length()) bearer = fresh;
+      }
+      size_t after = partSize();
+      stalls = (after > have) ? 0 : stalls + 1;  // any forward progress clears strikes
+      if (!ok || (size && after < size)) {
+        if (stalls >= kMaxStalls) {
+          if (!err.length()) err = "stalled " + label;
+          break;
+        }
+        Status::info(label + " resume @" + humanBytes(after) + (err.length() ? ": " + err : ""));
+        delay(500 * stalls + 200);
+        continue;
+      }
+    }
+
+    // Full byte count on disk; verify by re-hashing the finished file.
+    String got = hashFile(tmp);
+    if (got.equalsIgnoreCase(want)) {
       if (!SD_MMC.rename(tmp, dest)) {
         SD_MMC.remove(tmp);
         err = "rename " + label;
@@ -267,21 +331,11 @@ bool downloadBlob(const ImageRef& ref, const String& digest, size_t size,
       }
       return true;
     }
-
-    // Failure: discard the partial and (unless out of tries) go around again.
-    // A clean transfer that hashed wrong is a truncated body — also transient.
+    // Bad bytes TCP didn't catch (or a bad range stitch): discard and start over.
     SD_MMC.remove(tmp);
-    if (ok) err = "digest mismatch " + label;
-    if (attempt == kMaxAttempts) break;
-
-    // A 401 means the anonymous token expired mid-pull; mint a fresh one so this
-    // retry and every later layer carry a valid bearer.
-    if (err.endsWith("401")) {
-      String fresh, terr;
-      if (getAuthToken(ref, fresh, terr) && fresh.length()) bearer = fresh;
-    }
-    Status::info(label + " retry " + attempt + ": " + err);
-    delay(400 * attempt);
+    err = "digest mismatch " + label;
+    if (++stalls >= kMaxStalls) break;
+    delay(500 * stalls);
   }
   return false;
 }

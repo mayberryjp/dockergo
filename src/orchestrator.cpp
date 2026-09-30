@@ -46,9 +46,11 @@ void Orchestrator::doHome(const SiteConfig& home) {
   }
   Status::stage(DeviceState::Home, home.name);
 
-  // Each site reports its own needs; download the union while bandwidth is good.
+  // Each remote site reports its own needs; download the union while bandwidth
+  // is good. Home is skipped: it has ample bandwidth and pulls images directly.
   std::vector<String> wanted;
   for (const auto& site : _cfg->sites) {
+    if (&site == &home) continue;
     SummaryResult s = SummaryClient::fetch(site.summaryUrl);
     if (!s.ok) {
       Status::info(site.name + " sum: " + s.error);
@@ -75,15 +77,15 @@ void Orchestrator::doHome(const SiteConfig& home) {
       Status::info("cached " + ref.shortName());
       continue;
     }
-    Status::stage(DeviceState::Working, "DL " + ref.original);
+    Status::stage(DeviceState::Working, ref.original);
     PullResult pr = RegistryClient::pull(ref, platform);
     if (pr.ok) {
       ImageStore::markComplete(ref);
       ++got;
-      Status::event("Downloaded " + ref.original);
+      Status::event("FINISHED " + ref.original + " (" + pr.layerCount + " layers)");
     } else {
       ++fail;
-      Status::error("DL " + ref.original + ": " + pr.error);
+      Status::error(ref.original + ": " + pr.error);
     }
   }
   Status::event(String("HOME: +") + got + " have " + have + " fail " + fail);

@@ -69,8 +69,8 @@ void StatusDisplay::_drawHeader() {
   _tft.setTextColor(TFT_WHITE, bg);
   _tft.setTextDatum(TL_DATUM);
 
-  String header = String(_stateName(_state));
-  if (_stateLabel.length()) header += ": " + _stateLabel;
+  // State is shown by the header colour, so render just the label for max width.
+  String header = _stateLabel.length() ? _stateLabel : String(_stateName(_state));
   _tft.drawString(truncateToWidth(header, 20), 2, 0, 2);
 }
 

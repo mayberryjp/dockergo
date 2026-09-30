@@ -53,6 +53,6 @@ void loop() {
     return;
   }
   orchestrator.runCycle();
-  Status::info("Sleep 60s");
-  delay(60000);
+  Status::info("Sleep 6h");
+  delay(6UL * 60 * 60 * 1000);
 }
